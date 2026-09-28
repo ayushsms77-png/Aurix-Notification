@@ -14,6 +14,7 @@ import {
   Outfit_900Black,
 } from '@expo-google-fonts/outfit';
 import { AnimatedSplash } from './src/components/AnimatedSplash';
+import { initNotifications } from './src/services/NotificationService';
 import { RootNavigator } from './src/navigation/RootNavigator';
 import { PlayerProvider } from './src/hooks/usePlayer';
 import { LibraryProvider } from './src/hooks/useLibrary';
@@ -30,6 +31,12 @@ export default function App() {
     SplashScreen.hideAsync().catch(() => undefined);
   }, []);
   const finishSplash = useCallback(() => setSplashDone(true), []);
+
+  // Push notifications: channel + permission + token registration, once the
+  // splash is gone. Fully self-contained and failure-tolerant.
+  useEffect(() => {
+    if (splashDone) void initNotifications();
+  }, [splashDone]);
 
   // Proof-of-connection for the Android native module. Dev-only, no UI impact.
   useEffect(() => {

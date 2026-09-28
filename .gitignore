@@ -55,3 +55,7 @@ brag-output/
 
 # Gradle build cache inside local Expo modules
 modules/*/android/.gradle/
+
+# local env / secrets
+.env
+.env.local

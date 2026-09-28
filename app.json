@@ -31,7 +31,8 @@
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
       ],
-      "package": "com.sanyamjain04.NOTE"
+      "package": "com.sanyamjain04.NOTE",
+      "googleServicesFile": "./google-services.json"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -48,6 +49,14 @@
           "backgroundColor": "#000000"
         }
       ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#FA2D55",
+          "defaultChannel": "daily"
+        }
+      ],
       "./plugins/withCoreLibraryDesugaring",
       "./plugins/withAndroidAbis",
       "./plugins/withReleaseSigning"
@@ -56,7 +65,8 @@
     "extra": {
       "eas": {
         "projectId": "65a8b803-c802-43fc-b6a0-b2ea958ae534"
-      }
+      },
+      "supabaseFunctionsUrl": "https://gvjmhlwkunsqoimxjssn.supabase.co/functions/v1"
     }
   }
 }

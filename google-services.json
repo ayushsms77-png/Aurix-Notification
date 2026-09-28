@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "506869387374",
+    "project_id": "aurix-93268",
+    "storage_bucket": "aurix-93268.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:506869387374:android:e5af362f0fc27d6c2bd67f",
+        "android_client_info": {
+          "package_name": "com.sanyamjain04.NOTE"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB-bIl1BSE4GhTUTcWfyFs1G46YfEXdGZ0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
