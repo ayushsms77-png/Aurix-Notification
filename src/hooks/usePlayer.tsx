@@ -64,6 +64,8 @@ type PlayerContextType = {
   jumpTo: (trackId: string) => void;
   shuffle: boolean;
   toggleShuffle: () => void;
+  /** While shuffle is on: re-roll the upcoming order (updates the real queue). */
+  reshuffle: () => void;
   repeat: RepeatMode;
   cycleRepeat: () => void;
   isReady: boolean;
@@ -137,6 +139,9 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
    * for a listen that never actually restarted. */
   const historyWrittenFor = useRef<string | null>(null);
 
+  /** Identifies the newest "sync the native next slot" request so stale async work bails. */
+  const nextSlotToken = useRef(0);
+
   const bumpQueue = useCallback(() => setQueueVersion((v) => v + 1), []);
 
   // ---- persistence ------------------------------------------------------
@@ -148,44 +153,78 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   // ---- loading a track --------------------------------------------------
 
   /**
+   * Make the native player's queue agree with the JS queue about what plays
+   * NEXT.
+   *
+   * RNTP keeps a real "next" item (so the lock-screen Next button works) and
+   * will auto-advance into it when the track ends. If the JS queue changes
+   * (shuffle, reshuffle, reorder, play next, remove, clear...) and that item
+   * is not updated, the OLD next track still plays -- the queue "changed" in
+   * the UI only. So every queue mutation ends here.
+   *
+   * - Already-queued next item is correct -> nothing to do (no churn).
+   * - It is wrong -> removed immediately (so it can never be auto-played),
+   *   then the right one is queued as soon as its stream resolves. If the
+   *   track ends inside that window RNTP reports "nothing left" and the normal
+   *   onComplete path advances using the JS queue.
+   */
+  const syncNextSlot = useCallback(() => {
+    const q = queueRef.current;
+    const current = q.current;
+    const upcoming = q.peekNext();
+    const token = ++nextSlotToken.current;
+    preloader.schedule(upcoming);
+
+    // Only attach a next item to a track that is really loaded in the engine.
+    if (!current || playbackEngine.trackId !== current.id) return;
+
+    // A one-track loop has no separate next item to queue.
+    if (!upcoming || upcoming.id === current.id) {
+      playbackEngine.clearQueuedNext();
+      return;
+    }
+    if (playbackEngine.getQueuedNextId() === upcoming.id) return;
+    playbackEngine.clearQueuedNext();
+
+    MusicService.resolveStream(upcoming)
+      .then((nextStream) => {
+        // Drop the result if anything moved on while it was resolving.
+        if (token !== nextSlotToken.current) return;
+        if (queueRef.current.peekNext()?.id !== upcoming.id) return;
+        if (playbackEngine.trackId !== current.id) return;
+        playbackEngine.queueNext(upcoming, nextStream);
+      })
+      .catch(() => {
+        // Best-effort — the OS button simply stays as it was.
+      });
+  }, []);
+
+  /**
    * Bookkeeping for "this track is now genuinely the one playing" — called
    * both after a fresh load() succeeds AND when RNTP's own queue moves on by
    * itself (see the onActiveTrackChanged listener below). Does NOT touch
    * playback itself; in the second case audio is already correctly playing,
    * this only catches the app's own state up to match reality.
    */
-  const onTrackNowPlaying = useCallback((track: Track) => {
-    setCurrentTrack(track);
-    setIsLoading(false);
-    setError(null);
-    autoSkips.current = 0;
-    loadingTrackId.current = null;
-    // A track genuinely different from whatever history was last written
-    // for gets a fresh listen-tracking window; a same-track re-arrival
-    // (e.g. repeat-one) must not reopen it and log a duplicate.
-    if (historyWrittenFor.current !== track.id) historyWrittenFor.current = null;
-    LibraryService.recordPlay(track);
+  const onTrackNowPlaying = useCallback(
+    (track: Track) => {
+      setCurrentTrack(track);
+      setIsLoading(false);
+      setError(null);
+      autoSkips.current = 0;
+      loadingTrackId.current = null;
+      // A track genuinely different from whatever history was last written
+      // for gets a fresh listen-tracking window; a same-track re-arrival
+      // (e.g. repeat-one) must not reopen it and log a duplicate.
+      if (historyWrittenFor.current !== track.id) historyWrittenFor.current = null;
+      LibraryService.recordPlay(track);
 
-    // Warm exactly one track ahead, so pressing skip is instant, and put it
-    // into RNTP's own real queue once resolved so the lock-screen Next
-    // button renders enabled and Previous stops just restarting the current
-    // track (see PlaybackEngine.queueNext). This reuses MusicService's own
-    // de-duped/cached resolve — no duplicate network fetch.
-    const upcoming = queueRef.current.peekNext();
-    preloader.schedule(upcoming);
-    if (upcoming) {
-      MusicService.resolveStream(upcoming)
-        .then((nextStream) => {
-          // Only apply if the queue has not moved on in the meantime.
-          if (queueRef.current.peekNext()?.id === upcoming.id) {
-            playbackEngine.queueNext(upcoming, nextStream);
-          }
-        })
-        .catch(() => {
-          // Best-effort — the OS button simply stays as it was.
-        });
-    }
-  }, []);
+      // Warm one track ahead and put it in RNTP's real queue (lock-screen
+      // Next, gapless continue). See syncNextSlot.
+      syncNextSlot();
+    },
+    [syncNextSlot]
+  );
 
   const loadCurrent = useCallback(
     async (options: { autoPlay?: boolean; startPosition?: number } = {}) => {
@@ -231,6 +270,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         if (id !== loadId.current) return; // superseded by a newer load
         await playbackEngine.load(track, stream, options);
         if (id !== loadId.current) return;
+        playbackEngine.setRepeatOne(queueRef.current.repeat === 'one');
 
         if (__DEV__) console.log('[playback] started', track.title);
         onTrackNowPlaying(track);
@@ -307,30 +347,52 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     // the app finds out and catches its own state up, WITHOUT calling
     // playbackEngine.load() again (audio is already correctly playing).
     playbackEngine.on('onActiveTrackChanged', (mediaId) => {
+      const q = queueRef.current;
+      const expected = q.current;
+
+      // Same track (e.g. the native repeat-one loop): nothing changed.
+      if (expected && expected.id === mediaId) return;
+
+      // Safety net for repeat-one. The native player loops the item itself,
+      // so a track ending should never land on a different one. If it did
+      // (repeat-one was switched on at the very moment the track ended),
+      // put the repeating track back rather than following the drift.
+      // A user-pressed Next also arrives here, but that is never at the very
+      // end of the track, so it is followed normally below.
+      const s = statusRef.current;
+      const endedNaturally = s.duration > 0 && s.position >= s.duration - 1.5;
+      if (q.repeat === 'one' && expected && endedNaturally) {
+        void loadCurrent({ autoPlay: true });
+        return;
+      }
+
       // The track that just stopped being active — same skip-vs-complete
       // distinction next()/previous() already use elsewhere.
-      const leavingTrack = queueRef.current.current;
-      if (leavingTrack) {
-        if (historyWrittenFor.current === leavingTrack.id) {
-          TasteService.recordComplete(leavingTrack);
+      if (expected) {
+        if (historyWrittenFor.current === expected.id) {
+          TasteService.recordComplete(expected);
         } else {
-          TasteService.recordSkip(leavingTrack);
+          TasteService.recordSkip(expected);
         }
       }
 
-      // We only ever put queueRef's own peekNext() into RNTP, so that is
-      // what this almost always is; jumpTo is a defensive fallback for the
-      // rare case the JS queue changed shape after that track was queued
-      // (e.g. a manual reorder) — it re-aligns to whatever is truly playing
-      // instead of leaving the app showing something false.
+      // The native player is the ground truth for what is actually playing:
+      // move the JS queue to it. Normally it is the pre-queued peekNext();
+      // jumpTo covers a queue that changed shape after that item was queued.
+      // (next(false), not next(true): repeat-one must not veto a move the
+      // native player has already made.)
       const landed =
-        queueRef.current.peekNext()?.id === mediaId
-          ? queueRef.current.next(true)
-          : queueRef.current.jumpTo(mediaId);
+        q.peekNext()?.id === mediaId ? q.next(false) : q.jumpTo(mediaId);
 
       bumpQueue();
       persistQueue();
-      if (landed) onTrackNowPlaying(landed);
+      if (landed) {
+        onTrackNowPlaying(landed);
+      } else {
+        // Native is playing something the JS queue does not contain (it was
+        // removed while pre-queued): bring the engine back to the JS truth.
+        void loadCurrent({ autoPlay: true });
+      }
     });
     return () => {
       preloader.cancel();
@@ -384,6 +446,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         if (cancelled) return;
         if (snapshot.tracks?.length) {
           queueRef.current.restore(snapshot);
+          playbackEngine.setRepeatOne(queueRef.current.repeat === 'one');
           bumpQueue();
           const restored = queueRef.current.current;
           if (restored) {
@@ -581,8 +644,9 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       bumpQueue();
       persistQueue();
       if (wasEmpty) void loadCurrent({ autoPlay: true });
+      else syncNextSlot();
     },
-    [bumpQueue, loadCurrent, persistQueue]
+    [bumpQueue, loadCurrent, persistQueue, syncNextSlot]
   );
 
   const playNextInQueue = useCallback(
@@ -592,9 +656,9 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       bumpQueue();
       persistQueue();
       if (wasEmpty) void loadCurrent({ autoPlay: true });
-      else preloader.schedule(queueRef.current.peekNext());
+      else syncNextSlot();
     },
-    [bumpQueue, loadCurrent, persistQueue]
+    [bumpQueue, loadCurrent, persistQueue, syncNextSlot]
   );
 
   const removeFromQueue = useCallback(
@@ -609,9 +673,11 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
           playbackEngine.stop();
           setCurrentTrack(null);
         }
+      } else {
+        syncNextSlot();
       }
     },
-    [bumpQueue, loadCurrent, persistQueue]
+    [bumpQueue, loadCurrent, persistQueue, syncNextSlot]
   );
 
   const reorderQueue = useCallback(
@@ -619,8 +685,9 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       queueRef.current.reorder(from, to);
       bumpQueue();
       persistQueue();
+      syncNextSlot();
     },
-    [bumpQueue, persistQueue]
+    [bumpQueue, persistQueue, syncNextSlot]
   );
 
   /** Commit the drag-to-reorder sheet's new upcoming order (by track ids). */
@@ -629,15 +696,17 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       queueRef.current.reorderUpcoming(ids);
       bumpQueue();
       persistQueue();
+      syncNextSlot();
     },
-    [bumpQueue, persistQueue]
+    [bumpQueue, persistQueue, syncNextSlot]
   );
 
   const clearQueue = useCallback(() => {
     queueRef.current.clearUpcoming();
     bumpQueue();
     persistQueue();
-  }, [bumpQueue, persistQueue]);
+    syncNextSlot();
+  }, [bumpQueue, persistQueue, syncNextSlot]);
 
   const jumpTo = useCallback(
     (trackId: string) => {
@@ -654,14 +723,26 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     queueRef.current.toggleShuffle();
     bumpQueue();
     persistQueue();
-    preloader.schedule(queueRef.current.peekNext());
-  }, [bumpQueue, persistQueue]);
+    // The order of what plays next just changed: update the real queue.
+    syncNextSlot();
+  }, [bumpQueue, persistQueue, syncNextSlot]);
 
-  const cycleRepeat = useCallback(() => {
-    queueRef.current.cycleRepeat();
+  const reshuffle = useCallback(() => {
+    if (!queueRef.current.reshuffle()) return;
     bumpQueue();
     persistQueue();
-  }, [bumpQueue, persistQueue]);
+    syncNextSlot();
+  }, [bumpQueue, persistQueue, syncNextSlot]);
+
+  const cycleRepeat = useCallback(() => {
+    const mode = queueRef.current.cycleRepeat();
+    // Repeat-one is enforced by the native player, not just remembered in JS.
+    playbackEngine.setRepeatOne(mode === 'one');
+    bumpQueue();
+    persistQueue();
+    // What counts as "next" at the end of the queue depends on the mode.
+    syncNextSlot();
+  }, [bumpQueue, persistQueue, syncNextSlot]);
 
   // ---- context values ---------------------------------------------------
 
@@ -784,6 +865,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       jumpTo,
       shuffle: queueSnapshot.shuffle,
       toggleShuffle,
+      reshuffle,
       repeat: queueSnapshot.repeat,
       cycleRepeat,
       isReady,
@@ -815,6 +897,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       clearQueue,
       jumpTo,
       toggleShuffle,
+      reshuffle,
       cycleRepeat,
       isReady,
     ]
