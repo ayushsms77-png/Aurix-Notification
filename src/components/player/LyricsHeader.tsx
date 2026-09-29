@@ -95,15 +95,15 @@ const AurixWordmark: React.FC = () => {
 };
 
 // ---- waveform ---------------------------------------------------------------
-const BAR_COUNT = 5;
+const BAR_COUNT = 7;
 const BAR_W = 3;
 const BAR_GAP = 3;
-const BAR_H = 18;
+const BAR_H = 22;
 const BAR_REST = 0.28;
 // Different periods per bar so the bars never move in lock-step.
-const BAR_MS = [520, 380, 610, 440, 560];
-const BAR_LOW = [0.3, 0.22, 0.35, 0.25, 0.3];
-const BAR_HIGH = [0.85, 1, 0.7, 0.95, 0.8];
+const BAR_MS = [520, 380, 610, 440, 560, 400, 500];
+const BAR_LOW = [0.3, 0.22, 0.35, 0.25, 0.3, 0.28, 0.24];
+const BAR_HIGH = [0.75, 0.95, 0.7, 1, 0.8, 0.9, 0.65];
 
 /**
  * Compact animated waveform. Bars scale vertically on the native driver (no
@@ -154,13 +154,16 @@ export const LyricsHeader: React.FC<{ isPlaying: boolean }> = ({ isPlaying }) =>
 
 const styles = StyleSheet.create({
   row: {
+    // flex:1 so the row fills the header: wordmark hugs the left edge and the
+    // waveform sits at the far right, exactly where the playlist icon used to be.
+    flex: 1,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     // Same height the icon header had, so the artwork/lyrics area below never shifts.
     minHeight: 36,
   },
-  wordmark: { flexDirection: 'row', alignItems: 'center', paddingLeft: 2 },
+  wordmark: { flexDirection: 'row', alignItems: 'center' },
   waveform: { flexDirection: 'row', alignItems: 'center', height: BAR_H, paddingRight: 4 },
   bar: { width: BAR_W, height: BAR_H, borderRadius: BAR_W / 2, backgroundColor: HOT_PINK },
 });
