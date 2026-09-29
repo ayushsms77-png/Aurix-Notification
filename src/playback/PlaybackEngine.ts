@@ -3,6 +3,7 @@ import TrackPlayer, {
   Event,
   PlaybackState,
   PlayerCommand,
+  RepeatMode,
 } from '@rntp/player';
 import { appError, toAppError } from '../core/errors';
 import { ResolvedStream, Track } from '../core/types';
@@ -79,6 +80,12 @@ export class PlaybackEngine {
   private status: PlaybackStatus = { ...IDLE_STATUS };
   private currentTrackId: string | null = null;
   private desiredVolume = 1;
+  /**
+   * Repeat-one is handed to the native player, so the SAME item loops without
+   * JS in the loop. Anything else (off / all) is decided by the JS queue.
+   * Kept as a flag so it can be re-applied after every load().
+   */
+  private repeatOne = false;
 
   private loadTimer: ReturnType<typeof setTimeout> | null = null;
   private loadToken = 0;
@@ -127,6 +134,27 @@ export class PlaybackEngine {
     this.attachEventListeners();
     this.startProgressPolling();
     this.configured = true;
+    this.applyRepeatMode();
+  }
+
+  /**
+   * Repeat-one loops the current item natively. Without this, RNTP moves on
+   * into the item queueNext() pre-queued as soon as the track ends, while the
+   * JS queue (which still says "repeat one") believes nothing changed -- the
+   * audio advances but the title/artwork stay on the old song.
+   */
+  setRepeatOne(on: boolean): void {
+    this.repeatOne = on;
+    this.applyRepeatMode();
+  }
+
+  private applyRepeatMode(): void {
+    if (!this.configured) return;
+    try {
+      TrackPlayer.setRepeatMode(this.repeatOne ? RepeatMode.One : RepeatMode.Off);
+    } catch {
+      /* best effort: the JS guard in usePlayer still keeps repeat-one correct */
+    }
   }
 
   private attachEventListeners(): void {
@@ -176,6 +204,10 @@ export class PlaybackEngine {
         if (item?.mediaId && item.mediaId !== this.currentTrackId) {
           this.currentTrackId = item.mediaId;
           this.completionFired = false;
+          // Don't show the previous track's position/duration for the ~250ms
+          // until the next progress poll reads the new item.
+          this.status = { ...this.status, position: 0, duration: 0 };
+          this.listeners.onStatus?.(this.status);
           this.listeners.onActiveTrackChanged?.(item.mediaId);
           return;
         }
@@ -300,9 +332,20 @@ export class PlaybackEngine {
       const activeIndex = TrackPlayer.getActiveMediaItemIndex();
       if (activeIndex === null) return; // nothing is currently loaded
 
+      // Only ever attach a "next" item to the track the app believes is
+      // playing. If the native active item is something else (a load or an
+      // auto-advance is in flight), the index maths below would put the item
+      // in the wrong place -- skip and let the next sync handle it.
+      if (TrackPlayer.getActiveMediaItem()?.mediaId !== this.currentTrackId) return;
+
       const queue = TrackPlayer.getQueue();
       const nextIndex = activeIndex + 1;
       const item = this.toMediaItem(track, stream);
+
+      // Exactly ONE item may follow the current one: drop anything beyond it.
+      if (queue.length > nextIndex + 1) {
+        TrackPlayer.removeMediaItems(nextIndex + 1, queue.length);
+      }
 
       if (nextIndex < queue.length) {
         // Something is already queued there — only touch it if it is not
@@ -316,6 +359,39 @@ export class PlaybackEngine {
     } catch {
       // Best-effort: worst case the Next button stays as it was: still
       // functional via onRemoteNext, just possibly shown disabled.
+    }
+  }
+
+  /** Id of the item queued right after the current one, if any. */
+  getQueuedNextId(): string | null {
+    if (!this.configured) return null;
+    try {
+      const activeIndex = TrackPlayer.getActiveMediaItemIndex();
+      if (activeIndex === null) return null;
+      return TrackPlayer.getQueue()[activeIndex + 1]?.mediaId ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Remove whatever is queued after the current item.
+   *
+   * Called the moment the JS queue changes (shuffle, reshuffle, reorder,
+   * remove, ...) so the native player can never auto-advance into a track the
+   * app no longer intends to play next. If the track ends before the new next
+   * item is resolved and queued, RNTP reports "nothing left" and the normal
+   * onComplete path picks the correct track from the JS queue.
+   */
+  clearQueuedNext(): void {
+    if (!this.configured) return;
+    try {
+      const activeIndex = TrackPlayer.getActiveMediaItemIndex();
+      if (activeIndex === null) return;
+      const length = TrackPlayer.getQueue().length;
+      if (length > activeIndex + 1) TrackPlayer.removeMediaItems(activeIndex + 1, length);
+    } catch {
+      /* best effort */
     }
   }
 
@@ -343,6 +419,7 @@ export class PlaybackEngine {
       // fresh, correct queue, never a stale leftover "next" item.
       TrackPlayer.setMediaItems([this.toMediaItem(track, stream)]);
       TrackPlayer.setVolume(this.desiredVolume);
+      this.applyRepeatMode();
 
       // If the source never loads, surface a real error instead of hanging.
       this.clearLoadTimer();

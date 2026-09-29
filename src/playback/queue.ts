@@ -9,6 +9,12 @@ export type QueueSnapshot = {
   repeat: RepeatMode;
   /** Where this queue came from, shown as "PLAYING FROM" in Now Playing. */
   context: string;
+  /** Exact play order (track ids). Optional: older snapshots don't have it. */
+  order?: string[];
+  /** Unshuffled play order (track ids), restored when shuffle is turned off. */
+  natural?: string[];
+  /** Ids already played in the current pass; used so shuffle doesn't repeat them. */
+  visited?: string[];
 };
 
 export const EMPTY_QUEUE: QueueSnapshot = {
@@ -29,6 +35,17 @@ export const EMPTY_QUEUE: QueueSnapshot = {
 export class Queue {
   private tracks: Track[] = [];
   private order: number[] = []; // play order, as indices into `tracks`
+  /**
+   * The order tracks play in with shuffle OFF. While shuffle is off this is
+   * always identical to `order`; while it is on, it is kept aside so turning
+   * shuffle off restores the queue exactly (including tracks added or moved
+   * with "play next" in the meantime).
+   */
+  private natural: number[] = [];
+  /** Track ids that have played in the current pass. Shuffle never re-queues these. */
+  private visited = new Set<string>();
+  /** Pre-computed order for the next pass (repeat-all wrap), so peekNext() and next() agree. */
+  private wrapOrder: number[] | null = null;
   private position = -1; // index into `order`
   private shuffleOn = false;
   private repeatMode: RepeatMode = 'off';
@@ -82,12 +99,16 @@ export class Queue {
   }
 
   snapshot(): QueueSnapshot {
+    const ids = (arr: number[]) => arr.map((i) => this.tracks[i].id);
     return {
       tracks: this.items,
       index: this.currentIndex,
       shuffle: this.shuffleOn,
       repeat: this.repeatMode,
       context: this.contextLabel,
+      order: ids(this.order),
+      natural: ids(this.natural),
+      visited: [...this.visited],
     };
   }
 
@@ -96,9 +117,29 @@ export class Queue {
     this.shuffleOn = snapshot.shuffle ?? false;
     this.repeatMode = snapshot.repeat ?? 'off';
     this.contextLabel = snapshot.context ?? '';
-    this.rebuildOrder();
+    this.wrapOrder = null;
+
     const startAt = snapshot.index ?? -1;
+    const byId = new Map(this.tracks.map((t, i) => [t.id, i]));
+    const fromIds = (ids?: string[]): number[] | null => {
+      if (!ids || ids.length !== this.tracks.length) return null;
+      const out = ids.map((id) => byId.get(id));
+      if (out.some((i) => i === undefined) || new Set(out).size !== out.length) return null;
+      return out as number[];
+    };
+
+    // Prefer the exact saved orders so a restart doesn't re-roll the shuffle.
+    const natural = fromIds(snapshot.natural);
+    const order = fromIds(snapshot.order);
+    this.natural = natural ?? this.tracks.map((_, i) => i);
+    if (order) {
+      this.order = order;
+    } else {
+      this.rebuildOrder(startAt >= 0 ? startAt : undefined);
+    }
     this.position = startAt >= 0 ? this.order.indexOf(startAt) : -1;
+    this.visited = new Set((snapshot.visited ?? []).filter((id) => byId.has(id)));
+    this.markVisited();
   }
 
   // ---- writes -----------------------------------------------------------
@@ -112,9 +153,13 @@ export class Queue {
     const resolvedStart = target
       ? Math.max(0, this.tracks.findIndex((t) => t.id === target.id))
       : 0;
+    this.natural = this.tracks.map((_, i) => i);
     this.rebuildOrder(resolvedStart);
     this.position = this.order.indexOf(resolvedStart);
     if (this.position < 0) this.position = this.tracks.length ? 0 : -1;
+    this.wrapOrder = null;
+    this.visited = new Set();
+    this.markVisited();
   }
 
   /** Append to the end of the queue. */
@@ -126,22 +171,37 @@ export class Queue {
     const firstNew = this.tracks.length;
     this.tracks.push(...fresh);
     // Appended tracks go at the end of the play order, shuffled or not.
-    for (let i = 0; i < fresh.length; i++) this.order.push(firstNew + i);
-    if (this.position < 0 && this.order.length) this.position = 0;
+    for (let i = 0; i < fresh.length; i++) {
+      this.order.push(firstNew + i);
+      this.natural.push(firstNew + i);
+    }
+    this.wrapOrder = null;
+    if (this.position < 0 && this.order.length) {
+      this.position = 0;
+      this.markVisited();
+    }
   }
 
   /** Insert directly after the current track. */
   playNext(tracks: Track | Track[]): void {
-    const incoming = Array.isArray(tracks) ? tracks : [tracks];
+    const currentId = this.current?.id;
+    // Never duplicate the track that is already playing.
+    const incoming = (Array.isArray(tracks) ? tracks : [tracks]).filter((t) => t.id !== currentId);
     if (!incoming.length) return;
     // Remove any existing copies so "play next" actually moves them.
     for (const t of incoming) this.remove(t.id, { keepCurrent: true });
     const firstNew = this.tracks.length;
     this.tracks.push(...incoming);
-    const insertAt = this.position + 1;
-    const newOrder = incoming.map((_, i) => firstNew + i);
-    this.order.splice(insertAt, 0, ...newOrder);
-    if (this.position < 0 && this.order.length) this.position = 0;
+    const newIdx = incoming.map((_, i) => firstNew + i);
+    this.order.splice(this.position + 1, 0, ...newIdx);
+    // Same place in the unshuffled order, so turning shuffle off keeps it.
+    const curNatural = this.natural.indexOf(this.currentIndex);
+    this.natural.splice(curNatural >= 0 ? curNatural + 1 : this.natural.length, 0, ...newIdx);
+    this.wrapOrder = null;
+    if (this.position < 0 && this.order.length) {
+      this.position = 0;
+      this.markVisited();
+    }
   }
 
   /** Remove a track by id. Returns true if the current track was removed. */
@@ -153,8 +213,12 @@ export class Queue {
     const orderPos = this.order.indexOf(trackIndex);
     this.tracks.splice(trackIndex, 1);
     this.order.splice(orderPos, 1);
+    this.natural = this.natural.filter((i) => i !== trackIndex);
     // Every index after the removed one shifts down by one.
-    this.order = this.order.map((i) => (i > trackIndex ? i - 1 : i));
+    const shift = (i: number) => (i > trackIndex ? i - 1 : i);
+    this.order = this.order.map(shift);
+    this.natural = this.natural.map(shift);
+    this.wrapOrder = null;
     if (orderPos < this.position) {
       this.position -= 1;
     } else if (orderPos === this.position) {
@@ -162,6 +226,8 @@ export class Queue {
       this.position = Math.min(this.position, this.order.length - 1);
     }
     if (!this.order.length) this.position = -1;
+    // The track that slid into the current slot is now the one playing.
+    if (wasCurrent) this.markVisited();
     return wasCurrent;
   }
 
@@ -175,6 +241,8 @@ export class Queue {
     this.order.splice(clampedTo, 0, moved);
     // Keep pointing at the same track after the move.
     this.position = this.order.indexOf(currentOrderValue);
+    this.wrapOrder = null;
+    this.syncNatural();
   }
 
   /**
@@ -195,17 +263,24 @@ export class Queue {
     if (this.position < 0) {
       // Nothing playing: the given order simply becomes the play order.
       this.order = [...provided, ...missing];
+      this.wrapOrder = null;
+      this.syncNatural();
       return;
     }
 
     // Keep history + current exactly where they are, then the new order.
     const historyAndCurrent = this.order.slice(0, this.position + 1);
     this.order = [...historyAndCurrent, ...provided, ...missing];
+    this.wrapOrder = null;
+    this.syncNatural();
   }
 
   clear(): void {
     this.tracks = [];
     this.order = [];
+    this.natural = [];
+    this.visited = new Set();
+    this.wrapOrder = null;
     this.position = -1;
     this.contextLabel = '';
   }
@@ -219,15 +294,53 @@ export class Queue {
     }
     this.tracks = [current];
     this.order = [0];
+    this.natural = [0];
+    this.visited = new Set([current.id]);
+    this.wrapOrder = null;
     this.position = 0;
   }
 
+  /**
+   * Turn shuffle on/off without ever interrupting the current track.
+   *
+   * ON:  history (tracks already played this pass) and the current track stay
+   *      exactly where they are; every track NOT yet played is shuffled into
+   *      the upcoming part. If everything has been played, a fresh pass
+   *      starts with all the other tracks shuffled.
+   * OFF: the original (unshuffled) order comes back and playback continues
+   *      from the current track's place in it.
+   */
   setShuffle(on: boolean): void {
     if (this.shuffleOn === on) return;
     this.shuffleOn = on;
-    const currentTrackIndex = this.currentIndex;
-    this.rebuildOrder(currentTrackIndex >= 0 ? currentTrackIndex : undefined);
-    this.position = currentTrackIndex >= 0 ? this.order.indexOf(currentTrackIndex) : -1;
+    this.wrapOrder = null;
+    const cur = this.currentIndex;
+
+    if (!on) {
+      this.order = [...this.natural];
+      this.position = cur >= 0 ? this.order.indexOf(cur) : -1;
+      return;
+    }
+
+    const all = this.tracks.map((_, i) => i);
+    if (cur < 0) {
+      this.order = shuffled(all);
+      this.position = -1;
+      return;
+    }
+
+    let prefix = this.order
+      .slice(0, this.position)
+      .filter((i) => this.visited.has(this.tracks[i].id));
+    let rest = all.filter((i) => i !== cur && !prefix.includes(i));
+    if (!rest.length && prefix.length) {
+      // Everything has already played: start a new pass.
+      rest = prefix;
+      prefix = [];
+      this.visited = new Set([this.tracks[cur].id]);
+    }
+    this.order = [...prefix, cur, ...shuffled(rest)];
+    this.position = prefix.length;
   }
 
   toggleShuffle(): boolean {
@@ -235,13 +348,34 @@ export class Queue {
     return this.shuffleOn;
   }
 
+  /**
+   * Re-roll the upcoming order while shuffle is on. History and the current
+   * track are untouched, and the result is guaranteed to differ from what was
+   * queued (in particular the very next track changes) whenever at least two
+   * tracks are upcoming. Returns false if there was nothing to reshuffle.
+   */
+  reshuffle(): boolean {
+    if (!this.shuffleOn) return false;
+    const head = this.order.slice(0, this.position + 1);
+    const tail = this.order.slice(this.position + 1);
+    if (tail.length < 2) return false;
+    const next = shuffled(tail);
+    if (next[0] === tail[0]) {
+      const swapWith = 1 + Math.floor(Math.random() * (next.length - 1));
+      [next[0], next[swapWith]] = [next[swapWith], next[0]];
+    }
+    this.order = [...head, ...next];
+    this.wrapOrder = null;
+    return true;
+  }
+
   setRepeat(mode: RepeatMode): void {
     this.repeatMode = mode;
+    this.wrapOrder = null;
   }
 
   cycleRepeat(): RepeatMode {
-    this.repeatMode =
-      this.repeatMode === 'off' ? 'all' : this.repeatMode === 'all' ? 'one' : 'off';
+    this.setRepeat(this.repeatMode === 'off' ? 'all' : this.repeatMode === 'all' ? 'one' : 'off');
     return this.repeatMode;
   }
 
@@ -257,12 +391,11 @@ export class Queue {
     if (auto && this.repeatMode === 'one') return this.current;
     if (this.position < this.order.length - 1) {
       this.position += 1;
+      this.markVisited();
       return this.current;
     }
     if (this.repeatMode === 'all' || (this.repeatMode === 'one' && !auto)) {
-      // Reshuffle on wrap so a repeated shuffled queue is not identical.
-      if (this.shuffleOn) this.rebuildOrder();
-      this.position = 0;
+      this.wrap();
       return this.current;
     }
     return null; // end of queue
@@ -288,17 +421,21 @@ export class Queue {
     const orderPos = this.order.indexOf(trackIndex);
     if (orderPos < 0) return null;
     this.position = orderPos;
+    this.markVisited();
     return this.current;
   }
 
-  /** Peek at what next() would return, without moving. */
+  /**
+   * Peek at what next(false) would return, without moving. This is what gets
+   * pre-queued in the native player, so it must always agree with next().
+   */
   peekNext(): Track | null {
     if (!this.tracks.length) return null;
     if (this.position < this.order.length - 1) {
       return this.tracks[this.order[this.position + 1]] ?? null;
     }
-    if (this.repeatMode === 'all') return this.tracks[this.order[0]] ?? null;
-    return null;
+    if (this.repeatMode === 'off') return null;
+    return this.tracks[this.peekWrapOrder()[0]] ?? null;
   }
 
   // ---- internals --------------------------------------------------------
@@ -308,19 +445,61 @@ export class Queue {
    * so toggling shuffle never interrupts the track already playing.
    */
   private rebuildOrder(pinFirst?: number): void {
-    const indices = this.tracks.map((_, i) => i);
     if (!this.shuffleOn) {
-      this.order = indices;
+      this.order = [...this.natural];
       return;
     }
+    const indices = this.tracks.map((_, i) => i);
     const rest = pinFirst === undefined ? indices : indices.filter((i) => i !== pinFirst);
-    // Fisher-Yates.
-    for (let i = rest.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [rest[i], rest[j]] = [rest[j], rest[i]];
-    }
-    this.order = pinFirst === undefined ? rest : [pinFirst, ...rest];
+    const mixed = shuffled(rest);
+    this.order = pinFirst === undefined ? mixed : [pinFirst, ...mixed];
   }
+
+  /** While shuffle is off the play order IS the natural order. */
+  private syncNatural(): void {
+    if (!this.shuffleOn) this.natural = [...this.order];
+  }
+
+  private markVisited(): void {
+    const c = this.current;
+    if (c) this.visited.add(c.id);
+  }
+
+  /** Order for the next pass. Cached so peekNext() and next() agree. */
+  private peekWrapOrder(): number[] {
+    if (this.wrapOrder) return this.wrapOrder;
+    if (!this.shuffleOn) {
+      this.wrapOrder = [...this.natural];
+      return this.wrapOrder;
+    }
+    const lastPlayed = this.order[this.order.length - 1];
+    const mixed = shuffled(this.tracks.map((_, i) => i));
+    // Don't start the new pass with the track that just finished.
+    if (mixed.length > 1 && mixed[0] === lastPlayed) {
+      const swapWith = 1 + Math.floor(Math.random() * (mixed.length - 1));
+      [mixed[0], mixed[swapWith]] = [mixed[swapWith], mixed[0]];
+    }
+    this.wrapOrder = mixed;
+    return this.wrapOrder;
+  }
+
+  private wrap(): void {
+    this.order = this.peekWrapOrder();
+    this.wrapOrder = null;
+    this.position = 0;
+    this.visited = new Set();
+    this.markVisited();
+  }
+}
+
+/** Fisher-Yates on a copy. */
+function shuffled(items: number[]): number[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
 }
 
 function dedupe(tracks: Track[]): Track[] {
