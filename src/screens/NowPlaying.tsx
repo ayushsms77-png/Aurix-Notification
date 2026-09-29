@@ -31,6 +31,7 @@ import { ArtworkBackground } from '../components/player/ArtworkBackground';
 import { QueueSheet } from '../components/player/QueueSheet';
 import { SeekBar } from '../components/player/SeekBar';
 import { LyricsView } from '../components/player/LyricsView';
+import { LyricsHeader } from '../components/player/LyricsHeader';
 import { AddToPlaylistSheet } from '../components/lists/AddToPlaylistSheet';
 import { Track } from '../core/types';
 import { usePlayer } from '../hooks/usePlayer';
@@ -39,57 +40,6 @@ import { DownloadService } from '../services/DownloadService';
 import { useNavigation } from '@react-navigation/native';
 
 const { width } = Dimensions.get('window');
-
-/**
- * "Aurix" with a subtle left-to-right light sweep -- used ONLY as the
- * Lyrics-view header centerpiece (no glow/shadow, no plain "Aurix" text
- * anywhere else in the app). Built from per-letter opacity, staggered
- * left-to-right, rather than a glow/shadow -- much closer to "letters
- * light up" than a pulsing halo.
- */
-const GlowingWordmark: React.FC = () => {
-  const letters = 'Aurix'.split('');
-  const anims = useRef(letters.map(() => new Animated.Value(0))).current;
-
-  useEffect(() => {
-    const stagger = 90;
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.stagger(
-          stagger,
-          anims.map((v) =>
-            Animated.sequence([
-              Animated.timing(v, { toValue: 1, duration: 260, useNativeDriver: true }),
-              Animated.timing(v, { toValue: 0, duration: 420, useNativeDriver: true }),
-            ])
-          )
-        ),
-        Animated.delay(900),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  return (
-    <View style={styles.glowRow}>
-      {letters.map((ch, i) => (
-        <Animated.Text
-          key={i}
-          style={[
-            styles.glowWordmark,
-            {
-              opacity: anims[i].interpolate({ inputRange: [0, 1], outputRange: [0.55, 0.95] }),
-            },
-          ]}
-        >
-          {ch}
-        </Animated.Text>
-      ))}
-    </View>
-  );
-};
 
 export default function NowPlayingScreen() {
   const insets = useSafeAreaInsets();
@@ -108,6 +58,7 @@ export default function NowPlayingScreen() {
     previous,
     shuffle,
     toggleShuffle,
+    reshuffle,
     repeat,
     cycleRepeat,
     upcoming,
@@ -153,6 +104,16 @@ export default function NowPlayingScreen() {
     [reorderUpcoming]
   );
 
+  /** Small confirmation pulse on the shuffle icon when the order is re-rolled. */
+  const reshuffleBump = useRef(new Animated.Value(1)).current;
+  const handleReshuffle = useCallback(() => {
+    reshuffle();
+    Animated.sequence([
+      Animated.timing(reshuffleBump, { toValue: 1.3, duration: 110, useNativeDriver: true }),
+      Animated.timing(reshuffleBump, { toValue: 1, duration: 160, useNativeDriver: true }),
+    ]).start();
+  }, [reshuffle, reshuffleBump]);
+
   if (!currentTrack) return null;
 
   const liked = isLiked(currentTrack.id);
@@ -165,23 +126,29 @@ export default function NowPlayingScreen() {
 
       <View style={[styles.content, { paddingTop: insets.top + SIZES.xl, paddingBottom: insets.bottom + SIZES.md }]}>
 
-        {/* Decluttered Apple-style header — no "PLAYING FROM" */}
+        {/* Header. Lyrics view: just the pulsing wordmark + waveform -- no back
+            arrow / playlist button / artwork. Player view keeps its icons
+            (its chevron is how you leave; the Lyrics toggle below returns to it). */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerIcon}>
-            <ChevronDown color={COLORS.text.primary} size={28} />
-          </TouchableOpacity>
-          <View style={styles.headerCenter}>
-            {view === 'lyrics' && <GlowingWordmark />}
-          </View>
-          <TouchableOpacity style={styles.headerIcon} onPress={() => setAddingTrack(currentTrack)}>
-            <ListPlus color={COLORS.text.primary} size={24} />
-          </TouchableOpacity>
+          {view === 'lyrics' ? (
+            <LyricsHeader isPlaying={isPlaying} />
+          ) : (
+            <>
+              <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerIcon}>
+                <ChevronDown color={COLORS.text.primary} size={28} />
+              </TouchableOpacity>
+              <View style={styles.headerCenter} />
+              <TouchableOpacity style={styles.headerIcon} onPress={() => setAddingTrack(currentTrack)}>
+                <ListPlus color={COLORS.text.primary} size={24} />
+              </TouchableOpacity>
+            </>
+          )}
         </View>
 
         {view === 'player' ? (
           <>
             <View style={styles.artworkContainer}>
-              <Image source={{ uri: currentTrack.albumImageUrl }} style={styles.artwork} />
+              <Image key={currentTrack.id} source={{ uri: currentTrack.albumImageUrl }} style={styles.artwork} />
             </View>
 
             <View style={styles.infoContainer}>
@@ -216,8 +183,15 @@ export default function NowPlayingScreen() {
 
         {/* Main transport controls */}
         <View style={styles.controlsContainer}>
-          <TouchableOpacity onPress={toggleShuffle}>
-            <Shuffle color={shuffle ? COLORS.accent.green : COLORS.text.secondary} size={24} />
+          {/* Tap: shuffle on/off. Long-press while on: reshuffle the upcoming order. */}
+          <TouchableOpacity
+            onPress={toggleShuffle}
+            onLongPress={shuffle ? handleReshuffle : undefined}
+            delayLongPress={350}
+          >
+            <Animated.View style={{ transform: [{ scale: reshuffleBump }] }}>
+              <Shuffle color={shuffle ? COLORS.accent.green : COLORS.text.secondary} size={24} />
+            </Animated.View>
           </TouchableOpacity>
           <TouchableOpacity onPress={previous}>
             <SkipBack color={COLORS.text.primary} size={32} />
@@ -307,13 +281,6 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: SIZES.lg },
   headerIcon: { padding: SIZES.xs },
   headerCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  glowRow: { flexDirection: 'row' },
-  glowWordmark: {
-    fontFamily: FONTS.extrabold,
-    fontSize: 19,
-    color: COLORS.text.primary,
-    letterSpacing: 0.5,
-  },
   artworkContainer: {
     width: width - SIZES.lg * 2,
     height: width - SIZES.lg * 2,
