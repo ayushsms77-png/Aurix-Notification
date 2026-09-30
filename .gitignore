@@ -59,6 +59,3 @@ modules/*/android/.gradle/
 # local env / secrets
 .env
 .env.local
-# Firebase
-google-services.json
-GoogleService-Info.plist
