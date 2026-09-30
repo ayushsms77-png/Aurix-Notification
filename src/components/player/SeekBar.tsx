@@ -1,7 +1,8 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
-import { PanResponder, StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, Easing, PanResponder, StyleSheet, Text, View } from 'react-native';
 import { COLORS, SIZES, FONTS } from '../../constants/theme';
-import { useProgress } from '../../hooks/usePlayer';
+import { usePlayer } from '../../hooks/usePlayer';
+import { progressClock } from '../../playback/progressClock';
 
 /** Seconds -> m:ss, for the progress labels. */
 const formatTime = (seconds: number): string => {
@@ -18,35 +19,99 @@ type SeekBarProps = {
 };
 
 /**
- * Scrubber with three distinct notions of position.
+ * Scrubber.
  *
- *   actual      - what the engine reports (useProgress, ~4x a second)
- *   display     - what is drawn
- *   isSeeking   - whether the finger owns `display`
+ * The bar and thumb are driven by ONE animated value that runs on the native
+ * UI thread: while a song plays, the value simply glides from "where we are"
+ * to "the end of the track" at real speed. Nothing in JS has to tick for the
+ * bar to move, so a busy JS thread can no longer make it freeze and jump.
+ * It is re-aimed whenever the local clock re-anchors (seek, pause, resume,
+ * track change, or a real disagreement with the audio).
  *
- * While the finger is down, `display` follows the gesture alone and engine
- * updates are ignored, so a position tick can never yank the thumb out from
- * under the user. Exactly one native seek is issued, on release: seeking on
- * every move event made the bar fight the gesture and stutter.
+ * While the finger is down the gesture owns the bar; engine updates are
+ * ignored, and exactly one seek is issued on release.
  *
- * This component is also the only thing in the player subscribed to position,
- * so the rest of Now Playing no longer re-renders on every tick.
+ * The time labels are plain text refreshed when the displayed second changes.
  */
 export const SeekBar: React.FC<SeekBarProps> = ({ onSeek }) => {
-  const { position, duration } = useProgress();
+  const { duration: trackDuration } = usePlayer();
 
   const [barWidth, setBarWidth] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
   const [displayPosition, setDisplayPosition] = useState(0);
+  // Whole seconds + duration for the labels; changes about once a second.
+  const [labels, setLabels] = useState(() => ({
+    sec: Math.floor(progressClock.now()),
+    dur: progressClock.getDuration(),
+  }));
+  /** 0..1 progress, animated natively. */
+  const ratio = useRef(new Animated.Value(0)).current;
 
   // Refs mirror state for use inside PanResponder, which is created once and
   // would otherwise close over stale values.
   const barWidthRef = useRef(0);
   const durationRef = useRef(0);
   const displayRef = useRef(0);
+  const seekingRef = useRef(false);
 
+  const safeDurationNow = () => {
+    const d = progressClock.getDuration() || trackDuration;
+    return Number.isFinite(d) && d > 0 ? d : 0;
+  };
   barWidthRef.current = barWidth;
-  durationRef.current = Number.isFinite(duration) && duration > 0 ? duration : 0;
+  durationRef.current = safeDurationNow();
+  seekingRef.current = isSeeking;
+
+  /** Aim the native animation at the current clock state. */
+  const drive = useCallback(() => {
+    if (seekingRef.current) return;
+    const dur = durationRef.current || progressClock.getDuration() || trackDuration || 0;
+    const pos = progressClock.now();
+    ratio.stopAnimation();
+    const now = dur > 0 ? Math.min(1, Math.max(0, pos / dur)) : 0;
+    ratio.setValue(now);
+    if (progressClock.isPlaying() && dur > 0 && pos < dur) {
+      Animated.timing(ratio, {
+        toValue: 1,
+        duration: Math.max(0, (dur - pos) * 1000),
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [ratio, trackDuration]);
+
+  useEffect(() => {
+    drive();
+    const unsubscribe = progressClock.subscribe(() => {
+      drive();
+    });
+    return () => {
+      unsubscribe();
+      ratio.stopAnimation();
+    };
+  }, [drive, ratio]);
+
+  // When the finger lifts, resume following the clock.
+  useEffect(() => {
+    if (!isSeeking) drive();
+  }, [isSeeking, drive]);
+
+  // Labels: check a few times a second, re-render only when the second changes.
+  useEffect(() => {
+    const tick = () =>
+      setLabels((prev) => {
+        const sec = Math.floor(progressClock.now());
+        const dur = progressClock.getDuration();
+        return prev.sec === sec && prev.dur === dur ? prev : { sec, dur };
+      });
+    tick();
+    const id = setInterval(tick, 200);
+    const unsubscribe = progressClock.subscribe(tick);
+    return () => {
+      clearInterval(id);
+      unsubscribe();
+    };
+  }, []);
 
   /** Map an x offset within the bar to a safe position in seconds. */
   const positionForX = useCallback((x: number): number => {
@@ -78,6 +143,9 @@ export const SeekBar: React.FC<SeekBarProps> = ({ onSeek }) => {
 
           const next = positionForX(e.nativeEvent.locationX);
           displayRef.current = next;
+          seekingRef.current = true;
+          ratio.stopAnimation();
+          ratio.setValue(durationRef.current > 0 ? next / durationRef.current : 0);
           setDisplayPosition(next);
           setIsSeeking(true);
         },
@@ -92,6 +160,7 @@ export const SeekBar: React.FC<SeekBarProps> = ({ onSeek }) => {
           const next = positionForX(e.nativeEvent.locationX);
 
           displayRef.current = next;
+          ratio.setValue(durationRef.current > 0 ? next / durationRef.current : 0);
           setDisplayPosition(next);
         },
 
@@ -110,16 +179,16 @@ export const SeekBar: React.FC<SeekBarProps> = ({ onSeek }) => {
           setIsSeeking(false);
         },
       }),
-    [onSeek, positionForX]
+    [onSeek, positionForX, ratio]
   );
 
-  const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
-  const safePosition = Number.isFinite(position) && position > 0 ? position : 0;
-
-  const shown = isSeeking ? displayPosition : safePosition;
-  const ratio = safeDuration > 0 ? Math.min(1, Math.max(0, shown / safeDuration)) : 0;
-  const percent: `${number}%` = `${ratio * 100}%`;
+  const safeDuration = labels.dur || trackDuration || 0;
+  const shown = isSeeking ? displayPosition : labels.sec;
   const remaining = Math.max(0, safeDuration - shown);
+
+  // Fill and thumb slide by translation (native-driver friendly; width is not).
+  const fillX = ratio.interpolate({ inputRange: [0, 1], outputRange: [-barWidth, 0] });
+  const dotX = ratio.interpolate({ inputRange: [0, 1], outputRange: [0, barWidth] });
 
   return (
     <View style={styles.container}>
@@ -129,9 +198,12 @@ export const SeekBar: React.FC<SeekBarProps> = ({ onSeek }) => {
         onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}
         {...panResponder.panHandlers}
       >
-        <View style={[styles.barFill, { width: percent }]} />
-        <View
-          style={[styles.dot, { left: percent }, isSeeking && styles.dotActive]}
+        {/* The fill is clipped to the track; the thumb is not (it is taller than the track). */}
+        <View style={styles.fillClip}>
+          <Animated.View style={[styles.barFill, { transform: [{ translateX: fillX }] }]} />
+        </View>
+        <Animated.View
+          style={[styles.dot, isSeeking && styles.dotActive, { transform: [{ translateX: dotX }] }]}
         />
       </View>
 
@@ -154,13 +226,20 @@ const styles = StyleSheet.create({
     marginBottom: SIZES.sm,
     justifyContent: 'center',
   },
+  fillClip: {
+    ...StyleSheet.absoluteFill,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
   barFill: {
+    width: '100%',
     height: '100%',
     backgroundColor: COLORS.player.progressFill, // accent red, per Aurix — was white
     borderRadius: 2,
   },
   dot: {
     position: 'absolute',
+    left: 0,
     width: 12,
     height: 12,
     borderRadius: 6,

@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import Svg, { Defs, RadialGradient, Rect, Stop } from 'react-native-svg';
 import { COLORS, FONTS, SIZES } from '../../constants/theme';
-import { useProgress } from '../../hooks/usePlayer';
+import { progressClock } from '../../playback/progressClock';
 import { fetchLyrics, LyricsResult } from '../../services/lyrics';
 import { Track } from '../../core/types';
 import { EdgeFade } from './EdgeFade';
@@ -184,7 +184,6 @@ const LyricLine = memo(function LyricLine({
  * Both fade out softly at the top and bottom edge.
  */
 export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek }) => {
-  const { position } = useProgress();
   const [state, setState] = useState<LyricsResult & { loading: boolean }>({
     loading: true,
     synced: null,
@@ -228,10 +227,24 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
     };
   }, [track.id, duration]);
 
-  const activeIndex = useMemo(
-    () => (state.synced ? activeIndexAt(state.synced, position) : -1),
-    [state.synced, position]
-  );
+  // The active line comes from the local clock, checked 10x a second; the
+  // component only re-renders when the line actually changes.
+  const [activeIndex, setActiveIndex] = useState(-1);
+  useEffect(() => {
+    const lines = state.synced;
+    if (!lines) {
+      setActiveIndex(-1);
+      return;
+    }
+    const tick = () => setActiveIndex(activeIndexAt(lines, progressClock.now()));
+    tick();
+    const id = setInterval(tick, 100);
+    const unsubscribe = progressClock.subscribe(tick); // seeks/pauses update instantly
+    return () => {
+      clearInterval(id);
+      unsubscribe();
+    };
+  }, [state.synced]);
   const activeIndexRef = useRef(activeIndex);
   activeIndexRef.current = activeIndex;
 

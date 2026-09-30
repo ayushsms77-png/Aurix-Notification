@@ -5,10 +5,10 @@
 
 export type SyncedLine = { time: number; text: string };
 /**
- * The progress poll ticks ~4x a second, so a line that starts at t would show
- * up to ~250ms late. Switching a hair early makes lines land on the beat.
+ * The lyrics are checked against the clock every 100ms, so a line that starts
+ * at t could show up to 100ms late. Switching a hair early lands it on the beat.
  */
-export const LYRIC_LEAD_SECONDS = 0.2;
+export const LYRIC_LEAD_SECONDS = 0.1;
 
 /** 0 = active (sharp); 1..3 = increasingly blurred and dim. */
 export type LineTier = 0 | 1 | 2 | 3;
