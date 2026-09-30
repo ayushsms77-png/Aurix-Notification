@@ -378,24 +378,6 @@ export default function SearchScreen() {
               </View>
             )}
 
-            {showBrowse && (
-              <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Browse Categories</Text>
-                <View style={styles.categoriesGrid}>
-                  {BROWSE_CATEGORIES.map((category) => (
-                    <TouchableOpacity
-                      key={category.id}
-                      style={styles.categoryCard}
-                      activeOpacity={0.8}
-                      onPress={() => commitSearch(category.query)}
-                    >
-                      <Text style={styles.categoryName}>{category.name}</Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              </View>
-            )}
-
             {showBrowse && trending.length > 0 && (
               <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Trending Searches</Text>
@@ -428,6 +410,24 @@ export default function SearchScreen() {
                     </View>
                   </TouchableOpacity>
                 ))}
+              </View>
+            )}
+
+            {showBrowse && (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Browse Categories</Text>
+                <View style={styles.categoriesGrid}>
+                  {BROWSE_CATEGORIES.map((category) => (
+                    <TouchableOpacity
+                      key={category.id}
+                      style={styles.categoryCard}
+                      activeOpacity={0.8}
+                      onPress={() => commitSearch(category.query)}
+                    >
+                      <Text style={styles.categoryName}>{category.name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
               </View>
             )}
           </>
