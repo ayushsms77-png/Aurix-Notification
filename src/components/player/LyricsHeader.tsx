@@ -25,7 +25,7 @@ const GLYPHS = [
 ];
 const GLYPH_H = 18.35;
 const GLYPH_TOP = 17.1;
-const SCALE = 0.88; // ~19px type, same visual size as the previous wordmark
+const SCALE = 28 / 22; // glyphs are baked at 22px type; this makes them match the 28px lyric text
 const TRACKING = 1.2;
 
 const PULSE_HALF_MS = 950; // one full breath = 1.9s

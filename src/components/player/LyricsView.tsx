@@ -15,8 +15,8 @@ import { COLORS, FONTS, SIZES } from '../../constants/theme';
 import { useProgress } from '../../hooks/usePlayer';
 import { fetchLyrics, LyricsResult } from '../../services/lyrics';
 import { Track } from '../../core/types';
-import { FadeMask } from './FadeMask';
-import { activeIndexAt, layersFor, lineDistance, tierFor, translateFor } from './lyricsMath';
+import { EdgeFade } from './EdgeFade';
+import { activeIndexAt, layersFor, lineDistance, tierIndex, translateFor } from './lyricsMath';
 
 interface LyricsViewProps {
   track: Track;
@@ -35,14 +35,26 @@ const ANCHOR_RATIO = 0.27;
 /** Non-active lines are drawn a touch smaller (Apple Music does the same). */
 const INACTIVE_SCALE = 0.94;
 
-/** Blur radius: the lines right next to the active one, and everything further out. */
-const BLUR_NEAR = 3;
-const BLUR_FAR = 6.5;
-/** Brightness of blurred lines (0-1). */
-const NEAR_OPACITY = 0.62;
-const FAR_OPACITY = 0.36;
-/** Room around a blurred line so the blur can spread instead of being clipped. */
-const BLUR_PAD = 14;
+/**
+ * Blur radius (dp) and brightness (0-1) per focus level. Tuned against Apple
+ * Music: lines beside the active one are only softly blurred and fairly dim,
+ * and each step further out is blurrier and fainter. Blur radii already carry
+ * the requested ~5% reduction. Index 0 (active) is sharp and unused here.
+ */
+const BLUR = [0, 2.3, 3.3, 4.6];
+const TIER_OPACITY = [1, 0.47, 0.34, 0.22];
+/**
+ * Extra room on every side of a blurred line, and how far the lyrics area
+ * bleeds past the text column, so the blur spreads out instead of being
+ * clipped into a hard vertical edge at the left/right of the text.
+ */
+const BLEED = SIZES.lg;
+const BLUR_PAD = BLEED;
+/** Lines dissolve to nothing over this many dp at the top / bottom of the lyrics area. */
+const FADE_TOP = 70;
+const FADE_BOTTOM = 100;
+const PLAIN_FADE_TOP = 40;
+const PLAIN_FADE_BOTTOM = 80;
 
 const FOCUS_MS = 380; // sharp <-> blurred crossfade
 const SCROLL_MS = 640; // lyrics gliding up to the next line
@@ -63,10 +75,8 @@ const blurText = (radius: number) =>
         textShadowOffset: { width: 0, height: 0 },
         textShadowRadius: radius * 2.2,
       } as const);
-const NEAR_LAYER = blurLayer(BLUR_NEAR);
-const FAR_LAYER = blurLayer(BLUR_FAR);
-const NEAR_TEXT = blurText(BLUR_NEAR);
-const FAR_TEXT = blurText(BLUR_FAR);
+const LAYER_STYLE = [1, 2, 3].map((t) => blurLayer(BLUR[t]));
+const LAYER_TEXT = [1, 2, 3].map((t) => blurText(BLUR[t]));
 
 /** Soft light behind the active line: one neutral radial gradient, fading to nothing at every edge. */
 const GLOW_BASE_H = 100;
@@ -74,42 +84,58 @@ const GLOW_PAD_Y = 30;
 const GLOW_MOVE_MS = 460;
 
 /* ---------------------------------------------------------------------------
- * One lyric line = a sharp layer plus two blurred copies stacked on top of
- * each other. Focus changes crossfade them (opacity only, native driver), so
- * the blur eases in and out instead of popping.
+ * One lyric line = a sharp layer plus up to three blurred copies stacked on
+ * top of each other. Focus changes crossfade them (opacity only, native
+ * driver), so the blur eases in and out instead of popping.
  * ------------------------------------------------------------------------- */
 type LineProps = {
   index: number;
   time: number;
   text: string;
   distance: number;
+  top: number | undefined;
+  height: number | undefined;
+  areaHeight: number;
+  translate: Animated.Value | Animated.AnimatedMultiplication<number>;
   onSeek: (seconds: number) => void;
   onMeasure: (index: number, y: number, height: number) => void;
 };
 
-const LyricLine = memo(function LyricLine({ index, time, text, distance, onSeek, onMeasure }: LineProps) {
-  const tier = tierFor(distance);
-  const { near, far } = layersFor(distance);
+const LyricLine = memo(function LyricLine({
+  index,
+  time,
+  text,
+  distance,
+  top,
+  height,
+  areaHeight,
+  translate,
+  onSeek,
+  onMeasure,
+}: LineProps) {
+  const tier = tierIndex(distance);
+  const layers = layersFor(distance);
 
-  const sharp = useRef(new Animated.Value(tier === 'active' ? 1 : 0)).current;
-  const nearOp = useRef(new Animated.Value(tier === 'near' ? NEAR_OPACITY : 0)).current;
-  const farOp = useRef(new Animated.Value(tier === 'far' ? FAR_OPACITY : 0)).current;
-  const scale = useRef(new Animated.Value(tier === 'active' ? 1 : INACTIVE_SCALE)).current;
+  const sharp = useRef(new Animated.Value(tier === 0 ? 1 : 0)).current;
+  const tierOp = useRef([0, 1, 2, 3].map((t) => new Animated.Value(t === tier && t > 0 ? TIER_OPACITY[t] : 0))).current;
+  const scale = useRef(new Animated.Value(tier === 0 ? 1 : INACTIVE_SCALE)).current;
 
   useEffect(() => {
     const to = (v: Animated.Value, toValue: number) =>
       Animated.timing(v, { toValue, duration: FOCUS_MS, easing: Easing.inOut(Easing.cubic), useNativeDriver: true });
     const anim = Animated.parallel([
-      to(sharp, tier === 'active' ? 1 : 0),
-      to(nearOp, tier === 'near' ? NEAR_OPACITY : 0),
-      to(farOp, tier === 'far' ? FAR_OPACITY : 0),
-      to(scale, tier === 'active' ? 1 : INACTIVE_SCALE),
+      to(sharp, tier === 0 ? 1 : 0),
+      to(tierOp[1], tier === 1 ? TIER_OPACITY[1] : 0),
+      to(tierOp[2], tier === 2 ? TIER_OPACITY[2] : 0),
+      to(tierOp[3], tier === 3 ? TIER_OPACITY[3] : 0),
+      to(scale, tier === 0 ? 1 : INACTIVE_SCALE),
     ]);
     anim.start();
     return () => anim.stop();
-  }, [tier, sharp, nearOp, farOp, scale]);
+  }, [tier, sharp, tierOp, scale]);
 
   const shown = text || '…';
+  const mounted = [false, layers.t1, layers.t2, layers.t3];
 
   return (
     <Pressable
@@ -117,31 +143,33 @@ const LyricLine = memo(function LyricLine({ index, time, text, distance, onSeek,
       onLayout={(e) => onMeasure(index, e.nativeEvent.layout.y, e.nativeEvent.layout.height)}
       style={styles.linePress}
     >
-      <Animated.View style={{ transform: [{ scale }], transformOrigin: 'left center' }}>
-        {/* Sharp layer: also what gives the line its size. */}
-        <Animated.Text style={[styles.lineText, { opacity: sharp }]}>{shown}</Animated.Text>
+      <EdgeFade
+        translate={translate}
+        center={top != null && height != null ? top + height / 2 : undefined}
+        areaHeight={areaHeight}
+        fadeTop={FADE_TOP}
+        fadeBottom={FADE_BOTTOM}
+      >
+        <Animated.View style={{ transform: [{ scale }], transformOrigin: 'left center' }}>
+          {/* Sharp layer: also what gives the line its size. */}
+          <Animated.Text style={[styles.lineText, { opacity: sharp }]}>{shown}</Animated.Text>
 
-        {near && (
-          <Animated.View
-            pointerEvents="none"
-            accessibilityElementsHidden
-            importantForAccessibility="no-hide-descendants"
-            style={[styles.blurLayer, NEAR_LAYER, { opacity: nearOp }]}
-          >
-            <Text style={[styles.lineText, NEAR_TEXT]}>{shown}</Text>
-          </Animated.View>
-        )}
-        {far && (
-          <Animated.View
-            pointerEvents="none"
-            accessibilityElementsHidden
-            importantForAccessibility="no-hide-descendants"
-            style={[styles.blurLayer, FAR_LAYER, { opacity: farOp }]}
-          >
-            <Text style={[styles.lineText, FAR_TEXT]}>{shown}</Text>
-          </Animated.View>
-        )}
-      </Animated.View>
+          {[1, 2, 3].map(
+            (t) =>
+              mounted[t] && (
+                <Animated.View
+                  key={t}
+                  pointerEvents="none"
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  style={[styles.blurLayer, LAYER_STYLE[t - 1], { opacity: tierOp[t] }]}
+                >
+                  <Text style={[styles.lineText, LAYER_TEXT[t - 1]]}>{shown}</Text>
+                </Animated.View>
+              )
+          )}
+        </Animated.View>
+      </EdgeFade>
     </Pressable>
   );
 });
@@ -163,15 +191,21 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
     plain: null,
   });
   const [areaHeight, setAreaHeight] = useState(0);
-  /** Bumped when the active line's layout arrives (or changes) so scroll + glow can catch up. */
+  /** Bumped (debounced) when line layouts arrive/change so scroll, glow and fades catch up. */
   const [layoutTick, setLayoutTick] = useState(0);
+  const [placedReady, setPlacedReady] = useState(false);
 
   const lineTops = useRef<number[]>([]);
   const lineHeights = useRef<number[]>([]);
   const placed = useRef(false);
   const glowPlaced = useRef(false);
+  const tickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const contentY = useRef(new Animated.Value(0)).current;
+  // Plain lyrics scroll natively; this is their scroll offset, and its negation is
+  // "how far the content has moved", the same quantity contentY is for synced lyrics.
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const plainTranslate = useRef(Animated.multiply(scrollY, -1)).current;
   const glowY = useRef(new Animated.Value(0)).current;
   const glowScaleY = useRef(new Animated.Value(1)).current;
   const glowOpacity = useRef(new Animated.Value(0)).current;
@@ -184,6 +218,8 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
     placed.current = false;
     glowPlaced.current = false;
     glowOpacity.setValue(0);
+    scrollY.setValue(0);
+    setPlacedReady(false);
     fetchLyrics({ title: track.title, artist: track.artist.name, album: track.album, duration }).then((res) => {
       if (!cancelled) setState({ loading: false, ...res });
     });
@@ -200,12 +236,20 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
   activeIndexRef.current = activeIndex;
 
   const handleMeasure = useRef((index: number, y: number, height: number) => {
-    const changed = lineTops.current[index] !== y || lineHeights.current[index] !== height;
+    if (lineTops.current[index] === y && lineHeights.current[index] === height) return;
     lineTops.current[index] = y;
     lineHeights.current[index] = height;
-    // Only the line we are sitting on matters for scroll + glow.
-    if (changed && index === Math.max(activeIndexRef.current, 0)) setLayoutTick((t) => t + 1);
+    // Lines report one after another on first layout: batch them into one update.
+    if (tickTimer.current) clearTimeout(tickTimer.current);
+    tickTimer.current = setTimeout(() => setLayoutTick((t) => t + 1), 24);
   }).current;
+
+  useEffect(
+    () => () => {
+      if (tickTimer.current) clearTimeout(tickTimer.current);
+    },
+    []
+  );
 
   // Glide the lyrics so the active line sits at the anchor (before the first
   // line, line 0 sits there). The user never scrolls; this is the only motion.
@@ -217,6 +261,7 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
     if (!placed.current) {
       placed.current = true;
       contentY.setValue(target); // first placement: no flight from the top
+      setPlacedReady(true);
       return;
     }
     const anim = Animated.timing(contentY, {
@@ -274,61 +319,80 @@ export const LyricsView: React.FC<LyricsViewProps> = ({ track, duration, onSeek 
   // No timestamps: nothing to focus on, so show it plainly and let it scroll.
   if (!state.synced) {
     return (
-      <FadeMask top={28} bottom={72}>
-        <ScrollView
+      <View style={styles.viewport} onLayout={(e) => setAreaHeight(e.nativeEvent.layout.height)}>
+        <Animated.ScrollView
           style={styles.plainScroll}
           contentContainerStyle={styles.plainContent}
           showsVerticalScrollIndicator={false}
+          scrollEventThrottle={16}
+          onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true })}
         >
           {state.plain!.map((line, i) => (
-            <Text key={i} style={styles.plainLine}>
-              {line}
-            </Text>
+            <View
+              key={i}
+              onLayout={(e) => handleMeasure(i, e.nativeEvent.layout.y, e.nativeEvent.layout.height)}
+            >
+              <EdgeFade
+                translate={plainTranslate}
+                center={
+                  lineTops.current[i] != null ? lineTops.current[i] + (lineHeights.current[i] ?? 0) / 2 : undefined
+                }
+                areaHeight={areaHeight}
+                fadeTop={PLAIN_FADE_TOP}
+                fadeBottom={PLAIN_FADE_BOTTOM}
+              >
+                <Text style={styles.plainLine}>{line}</Text>
+              </EdgeFade>
+            </View>
           ))}
-        </ScrollView>
-      </FadeMask>
+        </Animated.ScrollView>
+      </View>
     );
   }
 
   return (
-    <FadeMask top={64} bottom={96}>
-      <View style={styles.viewport} onLayout={(e) => setAreaHeight(e.nativeEvent.layout.height)}>
-        <Animated.View style={[styles.content, { transform: [{ translateY: contentY }] }]}>
-          {/* Diffused light behind the active line; drawn first so text sits on top. */}
-          <Animated.View
-            pointerEvents="none"
-            style={[
-              styles.glow,
-              { opacity: glowOpacity, transform: [{ translateY: glowY }, { scaleY: glowScaleY }] },
-            ]}
-          >
-            <Svg width="100%" height="100%" preserveAspectRatio="none">
-              <Defs>
-                <RadialGradient id="lyricGlow" cx="50%" cy="50%" rx="50%" ry="50%">
-                  <Stop offset="0" stopColor="#FFFFFF" stopOpacity={0.11} />
-                  <Stop offset="0.45" stopColor="#FFFFFF" stopOpacity={0.055} />
-                  <Stop offset="0.75" stopColor="#FFFFFF" stopOpacity={0.02} />
-                  <Stop offset="1" stopColor="#FFFFFF" stopOpacity={0} />
-                </RadialGradient>
-              </Defs>
-              <Rect x="0" y="0" width="100%" height="100%" fill="url(#lyricGlow)" />
-            </Svg>
-          </Animated.View>
-
-          {state.synced.map((line, i) => (
-            <LyricLine
-              key={`${track.id}:${i}`}
-              index={i}
-              time={line.time}
-              text={line.text}
-              distance={lineDistance(i, activeIndex)}
-              onSeek={onSeek}
-              onMeasure={handleMeasure}
-            />
-          ))}
+    <View style={styles.viewport} onLayout={(e) => setAreaHeight(e.nativeEvent.layout.height)}>
+      <Animated.View
+        style={[styles.content, { opacity: placedReady ? 1 : 0, transform: [{ translateY: contentY }] }]}
+      >
+        {/* Diffused light behind the active line; drawn first so text sits on top. */}
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.glow,
+            { opacity: glowOpacity, transform: [{ translateY: glowY }, { scaleY: glowScaleY }] },
+          ]}
+        >
+          <Svg width="100%" height="100%" preserveAspectRatio="none">
+            <Defs>
+              <RadialGradient id="lyricGlow" cx="50%" cy="50%" rx="50%" ry="50%">
+                <Stop offset="0" stopColor="#FFFFFF" stopOpacity={0.11} />
+                <Stop offset="0.45" stopColor="#FFFFFF" stopOpacity={0.055} />
+                <Stop offset="0.75" stopColor="#FFFFFF" stopOpacity={0.02} />
+                <Stop offset="1" stopColor="#FFFFFF" stopOpacity={0} />
+              </RadialGradient>
+            </Defs>
+            <Rect x="0" y="0" width="100%" height="100%" fill="url(#lyricGlow)" />
+          </Svg>
         </Animated.View>
-      </View>
-    </FadeMask>
+
+        {state.synced.map((line, i) => (
+          <LyricLine
+            key={`${track.id}:${i}`}
+            index={i}
+            time={line.time}
+            text={line.text}
+            distance={lineDistance(i, activeIndex)}
+            top={lineTops.current[i]}
+            height={lineHeights.current[i]}
+            areaHeight={areaHeight}
+            translate={contentY}
+            onSeek={onSeek}
+            onMeasure={handleMeasure}
+          />
+        ))}
+      </Animated.View>
+    </View>
   );
 };
 
@@ -348,8 +412,9 @@ const styles = StyleSheet.create({
   },
   // ---- plain (no timestamps) ----
   plainScroll: { flex: 1 },
-  // No side padding: the text starts at the same left edge as the header and seek bar.
-  plainContent: { paddingTop: 28, paddingBottom: 72 },
+  // The area bleeds BLEED past the text column on both sides; this padding puts
+  // the text back on the same left edge as the header and seek bar.
+  plainContent: { paddingTop: 44, paddingBottom: 88, paddingHorizontal: BLEED },
   plainLine: {
     fontFamily: FONTS.bold,
     fontSize: 24,
@@ -359,9 +424,9 @@ const styles = StyleSheet.create({
     textAlign: 'left',
   },
   // ---- synced ----
-  viewport: { flex: 1, overflow: 'hidden' },
+  viewport: { flex: 1, overflow: 'hidden', marginHorizontal: -BLEED },
   // Taller than the viewport on purpose; it is slid up and down by translateY.
-  content: { position: 'absolute', top: 0, left: 0, right: 0 },
+  content: { position: 'absolute', top: 0, left: 0, right: 0, paddingHorizontal: BLEED },
   glow: {
     position: 'absolute',
     left: 0,
