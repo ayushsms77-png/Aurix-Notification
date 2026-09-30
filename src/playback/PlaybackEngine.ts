@@ -7,6 +7,7 @@ import TrackPlayer, {
 } from '@rntp/player';
 import { appError, toAppError } from '../core/errors';
 import { ResolvedStream, Track } from '../core/types';
+import { progressClock } from './progressClock';
 
 export type PlaybackStatus = {
   isPlaying: boolean;
@@ -60,7 +61,7 @@ type EngineEvents = {
    * own queue as ground truth for *which track is actually playing*, not
    * assume it only changes when the app itself calls load().
    */
-  onActiveTrackChanged: (mediaId: string) => void;
+  onActiveTrackChanged: (mediaId: string, info: { endedNaturally: boolean }) => void;
 };
 
 /**
@@ -93,7 +94,10 @@ export class PlaybackEngine {
 
   private configured = false;
 
-  private progressTimer: ReturnType<typeof setInterval> | null = null;
+  /** Safety net only: reads the native position if progress events ever stop arriving. */
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private primeTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastProgressAt = 0;
   private eventSubs: { remove: () => void }[] = [];
 
   on<K extends keyof EngineEvents>(event: K, handler: EngineEvents[K]): void {
@@ -104,6 +108,14 @@ export class PlaybackEngine {
     return this.status;
   }
 
+  /**
+   * Current position in seconds, from the local clock (never a native call).
+   * Accurate to a few hundredths of a second while playing.
+   */
+  getPosition(): number {
+    return progressClock.now();
+  }
+
   /** Set up the player once. Safe to call repeatedly. Fully synchronous. */
   configure(): void {
     if (this.configured) return;
@@ -111,6 +123,11 @@ export class PlaybackEngine {
     TrackPlayer.setupPlayer({
       contentType: 'music',
       handleAudioBecomingNoisy: true,
+      // The native player pushes its position to JS once a second, as an
+      // event. Reading it the other way round (getProgress) is a BLOCKING
+      // call that makes the JS thread wait for Android's UI thread -- when
+      // that thread is busy, the seek bar and lyrics froze and then jumped.
+      progressSync: { intervalSeconds: 1 },
     });
 
     // handling: 'hybrid' keeps Play/Pause/Seek on RNTP's reliable native
@@ -132,7 +149,7 @@ export class PlaybackEngine {
     });
 
     this.attachEventListeners();
-    this.startProgressPolling();
+    this.startProgressWatchdog();
     this.configured = true;
     this.applyRepeatMode();
   }
@@ -167,7 +184,20 @@ export class PlaybackEngine {
     this.eventSubs.push(
       TrackPlayer.addEventListener(Event.IsPlayingChanged, ({ playing }) => {
         this.status = { ...this.status, isPlaying: playing };
+        // Give the native progress events a moment before the watchdog worries.
+        this.lastProgressAt = Date.now();
+        progressClock.setPlaying(playing);
         this.listeners.onStatus?.(this.status);
+      })
+    );
+
+    // Position, pushed from native once a second while audio plays (plus one
+    // final tick when it pauses). The local clock fills in the time between.
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, (e) => {
+        if (e.mediaId !== this.currentTrackId) return; // a previous track's last tick
+        this.lastProgressAt = Date.now();
+        this.applyReading(e.position, e.duration, { ageMs: Date.now() - e.timestamp });
       })
     );
 
@@ -202,13 +232,27 @@ export class PlaybackEngine {
     this.eventSubs.push(
       TrackPlayer.addEventListener(Event.MediaItemTransition, ({ item }) => {
         if (item?.mediaId && item.mediaId !== this.currentTrackId) {
+          // Work out whether the previous track ran to its end BEFORE the clock
+          // is reset for the new one (repeat-one's safety net needs this).
+          const total = this.status.duration;
+          const endedNaturally = total > 0 && progressClock.now() >= total - 1.5;
           this.currentTrackId = item.mediaId;
           this.completionFired = false;
-          // Don't show the previous track's position/duration for the ~250ms
-          // until the next progress poll reads the new item.
+          // A new item is now playing from 0: don't show the previous
+          // track's position/duration while the first real reading arrives.
           this.status = { ...this.status, position: 0, duration: 0 };
+          progressClock.reset(0, 0, this.status.isPlaying);
+          this.primeProgress();
           this.listeners.onStatus?.(this.status);
-          this.listeners.onActiveTrackChanged?.(item.mediaId);
+          this.listeners.onActiveTrackChanged?.(item.mediaId, { endedNaturally });
+          return;
+        }
+
+        // Same item again (our own load(), or the native repeat-one loop
+        // starting over): take one real reading so the clock restarts exactly.
+        if (item?.mediaId) {
+          this.completionFired = false;
+          this.primeProgress();
           return;
         }
 
@@ -221,29 +265,77 @@ export class PlaybackEngine {
     );
   }
 
-  /** No per-tick position event in this API — poll on the old 250ms cadence. */
-  private startProgressPolling(): void {
-    if (this.progressTimer) return;
-    this.progressTimer = setInterval(() => {
-      try {
-        const progress = TrackPlayer.getProgress();
-        const duration = Number.isFinite(progress.duration) && progress.duration > 0
-          ? progress.duration
-          : 0;
-        const position = Number.isFinite(progress.position)
-          ? Math.max(0, progress.position)
-          : 0;
+  /**
+   * Take a position reading (from a native event or a one-off read), move the
+   * local clock, and keep `status` in step. Runs about once a second.
+   */
+  private applyReading(
+    positionRaw: number,
+    durationRaw: number,
+    opts: { force?: boolean; ageMs?: number } = {}
+  ): void {
+    if (!Number.isFinite(positionRaw)) return; // garbage reading: keep what we have
+    const duration = Number.isFinite(durationRaw) && durationRaw > 0 ? durationRaw : 0;
+    const position = Math.max(0, positionRaw);
 
-        if (duration > 0 && this.loadTimer) {
-          this.clearLoadTimer();
-        }
+    if (duration > 0 && this.loadTimer) this.clearLoadTimer();
 
-        this.status = { ...this.status, position, duration };
-        this.listeners.onStatus?.(this.status);
-      } catch {
-        /* transient — the queue may be momentarily empty */
-      }
-    }, 250);
+    progressClock.sync(position, duration, this.status.isPlaying, opts);
+
+    const keepDuration = duration > 0 ? duration : this.status.duration;
+    if (position !== this.status.position || keepDuration !== this.status.duration) {
+      this.status = { ...this.status, position, duration: keepDuration };
+      this.listeners.onStatus?.(this.status);
+    }
+  }
+
+  /**
+   * One real read of the native position. BLOCKING (it waits for Android's UI
+   * thread), so it is only used in rare moments -- a new track, or as the
+   * watchdog below -- never on a steady timer.
+   */
+  private readNow(force: boolean): void {
+    try {
+      const progress = TrackPlayer.getProgress();
+      this.applyReading(progress.position, progress.duration, { force });
+    } catch {
+      /* transient — the queue may be momentarily empty */
+    }
+  }
+
+  /**
+   * Right after a track starts, the first progress event is up to a second
+   * away and the duration is unknown. A few quick reads fill that gap, and
+   * stop as soon as the duration is known.
+   */
+  private primeProgress(): void {
+    if (this.primeTimer) clearTimeout(this.primeTimer);
+    const token = this.loadToken;
+    const delays = [150, 350, 700, 1200, 2000];
+    const step = (i: number) => {
+      this.primeTimer = setTimeout(() => {
+        this.primeTimer = null;
+        if (token !== this.loadToken || !this.currentTrackId) return;
+        this.readNow(i === 0);
+        if (this.status.duration <= 0 && i + 1 < delays.length) step(i + 1);
+      }, delays[i] - (i > 0 ? delays[i - 1] : 0));
+    };
+    step(0);
+  }
+
+  /**
+   * Safety net. Progress events normally arrive every second; if they stop
+   * (an unexpected player state) the clock would only coast. So if playing and
+   * nothing has been heard for a while, read the position once to re-sync.
+   */
+  private startProgressWatchdog(): void {
+    if (this.watchdogTimer) return;
+    this.watchdogTimer = setInterval(() => {
+      if (!this.status.isPlaying || !this.currentTrackId) return;
+      if (Date.now() - this.lastProgressAt < 3000) return;
+      this.lastProgressAt = Date.now();
+      this.readNow(false);
+    }, 1500);
   }
 
   private handlePlaybackStateChanged(state: PlaybackState): void {
@@ -411,6 +503,8 @@ export class PlaybackEngine {
       this.completionFired = false;
 
       this.status = { ...IDLE_STATUS, isBuffering: true, volume: this.desiredVolume };
+      progressClock.reset(startPosition, 0, false);
+      this.lastProgressAt = Date.now();
       this.listeners.onStatus?.(this.status);
 
       // setMediaItems() replaces the whole queue with this one track. This
@@ -440,6 +534,7 @@ export class PlaybackEngine {
       if (autoPlay) {
         TrackPlayer.play();
       }
+      this.primeProgress();
     } catch (e) {
       this.clearLoadTimer();
       throw toAppError(e, 'playback_failed');
@@ -472,6 +567,9 @@ export class PlaybackEngine {
       this.completionFired = false;
       TrackPlayer.seekTo(target);
 
+      // Re-anchor the clock right away: the bar and lyrics jump to the new
+      // spot immediately instead of waiting for the next native event.
+      progressClock.sync(target, duration, this.status.isPlaying, { force: true });
       this.status = { ...this.status, position: target };
       this.listeners.onStatus?.(this.status);
     } catch (e) {
@@ -510,6 +608,11 @@ export class PlaybackEngine {
       /* already torn down */
     }
 
+    if (this.primeTimer) {
+      clearTimeout(this.primeTimer);
+      this.primeTimer = null;
+    }
+    progressClock.reset();
     this.status = { ...IDLE_STATUS, volume: this.desiredVolume };
     this.listeners.onStatus?.(this.status);
   }
@@ -523,9 +626,13 @@ export class PlaybackEngine {
 
     this.clearLoadTimer();
 
-    if (this.progressTimer) {
-      clearInterval(this.progressTimer);
-      this.progressTimer = null;
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    if (this.primeTimer) {
+      clearTimeout(this.primeTimer);
+      this.primeTimer = null;
     }
 
     for (const sub of this.eventSubs) {
