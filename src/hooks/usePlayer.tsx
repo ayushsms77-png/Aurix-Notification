@@ -12,6 +12,7 @@ import { AppState, Platform, PermissionsAndroid } from 'react-native';
 import { AppError, messageFor, toAppError } from '../core/errors';
 import { RepeatMode, Track } from '../core/types';
 import { flushWrites, readJson, writeJsonDebounced, STORAGE_KEYS } from '../core/storage';
+import { progressClock } from '../playback/progressClock';
 import { playbackEngine, IDLE_STATUS, PlaybackStatus } from '../playback/PlaybackEngine';
 import { Queue, QueueSnapshot, EMPTY_QUEUE } from '../playback/queue';
 import { preloader } from '../playback/preload';
@@ -86,15 +87,6 @@ const HISTORY_MIN_RATIO = 0.25;
 const MAX_AUTO_SKIPS = 3;
 
 const PlayerContext = createContext<PlayerContextType | undefined>(undefined);
-
-/**
- * Progress lives in its own context because it updates ~4x a second. Screens
- * that only need the current track never re-render on a position tick.
- */
-const ProgressContext = createContext<{ position: number; duration: number }>({
-  position: 0,
-  duration: 0,
-});
 
 export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const queueRef = useRef(new Queue());
@@ -346,7 +338,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     // after the current one, RNTP can move on to it by itself — this is how
     // the app finds out and catches its own state up, WITHOUT calling
     // playbackEngine.load() again (audio is already correctly playing).
-    playbackEngine.on('onActiveTrackChanged', (mediaId) => {
+    playbackEngine.on('onActiveTrackChanged', (mediaId, { endedNaturally }) => {
       const q = queueRef.current;
       const expected = q.current;
 
@@ -359,8 +351,6 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       // put the repeating track back rather than following the drift.
       // A user-pressed Next also arrives here, but that is never at the very
       // end of the track, so it is followed normally below.
-      const s = statusRef.current;
-      const endedNaturally = s.duration > 0 && s.position >= s.duration - 1.5;
       if (q.repeat === 'one' && expected && endedNaturally) {
         void loadCurrent({ autoPlay: true });
         return;
@@ -488,8 +478,9 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   }, []);
 
   // ---- persist playback position ---------------------------------------
-  // Position ticks ~4x a second but is persisted in whole seconds, so only
-  // react when the second actually changes.
+  // `status.position` now updates about once a second (native progress
+  // events); it is persisted in whole seconds, so only react when the second
+  // actually changes. The UI itself reads position from the local clock.
   const positionSecond = Math.floor(status.position);
   useEffect(() => {
     if (!currentTrack) return;
@@ -585,7 +576,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
 
   const previous = useCallback(() => {
     // Standard behaviour: restart the track if we are more than 3s in.
-    if (statusRef.current.position > 3) {
+    if (playbackEngine.getPosition() > 3) {
       void playbackEngine.seekTo(0);
       return;
     }
@@ -609,7 +600,8 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
    */
   const seekBy = useCallback(
     (deltaSeconds: number) => {
-      const { duration, position } = statusRef.current;
+      const { duration } = statusRef.current;
+      const position = playbackEngine.getPosition();
       const total = duration || currentTrack?.duration || 0;
       const target = position + deltaSeconds;
       const clamped = total > 0 ? Math.min(total, Math.max(0, target)) : Math.max(0, target);
@@ -903,15 +895,8 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     ]
   );
 
-  const progressValue = useMemo(
-    () => ({ position: status.position, duration }),
-    [status.position, duration]
-  );
-
   return (
-    <PlayerContext.Provider value={value}>
-      <ProgressContext.Provider value={progressValue}>{children}</ProgressContext.Provider>
-    </PlayerContext.Provider>
+    <PlayerContext.Provider value={value}>{children}</PlayerContext.Provider>
   );
 };
 
@@ -924,4 +909,35 @@ export const usePlayer = () => {
 };
 
 /** Subscribe to playback position without re-rendering on every other change. */
-export const useProgress = () => useContext(ProgressContext);
+/**
+ * Playback position for the UI, read from the local clock (see progressClock).
+ * Each caller ticks on its own timer, only while mounted; nothing else in the
+ * app re-renders for position. `duration` falls back to the track's own.
+ */
+export const useProgress = (intervalMs = 250): { position: number; duration: number } => {
+  const { duration: trackDuration } = usePlayer();
+  const [p, setP] = useState(() => ({
+    position: progressClock.now(),
+    duration: progressClock.getDuration(),
+  }));
+
+  useEffect(() => {
+    const tick = () =>
+      setP((prev) => {
+        const position = progressClock.now();
+        const duration = progressClock.getDuration();
+        return Math.abs(prev.position - position) < 0.01 && prev.duration === duration
+          ? prev
+          : { position, duration };
+      });
+    tick();
+    const id = setInterval(tick, intervalMs);
+    const unsubscribe = progressClock.subscribe(tick);
+    return () => {
+      clearInterval(id);
+      unsubscribe();
+    };
+  }, [intervalMs]);
+
+  return { position: p.position, duration: p.duration || trackDuration };
+};
